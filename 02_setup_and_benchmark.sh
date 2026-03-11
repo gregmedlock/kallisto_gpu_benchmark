@@ -40,14 +40,6 @@ fi
 KALLISTO=$(which kallisto)
 log "kallisto: $($KALLISTO version)"
 
-# ---- Install SRA toolkit -------------------------------------------------
-if ! command -v fasterq-dump &>/dev/null; then
-    log "Installing SRA toolkit..."
-    wget -q https://ftp-trace.ncbi.nlm.nih.gov/sra/sdk/current/sratoolkit.current-ubuntu64.tar.gz
-    tar -xzf sratoolkit.current-ubuntu64.tar.gz
-    sudo cp sratoolkit.*/bin/fasterq-dump sratoolkit.*/bin/prefetch /usr/local/bin/
-fi
-
 # ---- Download reference index --------------------------------------------
 log "Building human kallisto index (Ensembl 113)..."
 if [ ! -f human_index.idx ] || [ ! -s human_index.idx ]; then
@@ -60,18 +52,25 @@ if [ ! -f human_index.idx ] || [ ! -s human_index.idx ]; then
 fi
 
 # ---- Download test samples -----------------------------------------------
+# Download paired FASTQ directly from ENA (no SRA toolkit required).
+# ENA FTP path: /vol1/fastq/SRR{first3}/{subdir}/{SRR}/
+# subdir depends on accession digit count: 7→00{d7}, 8→0{d7d8}, 9+→{d7d8d9}
 download_sample() {
     local SRR="$1"
-    if [ ! -f "${SRR}_1.fastq.gz" ]; then
-        log "Downloading $SRR..."
-        prefetch "$SRR" --output-directory .
-        fasterq-dump "$SRR" --split-files --outdir . --threads "$THREADS"
-        # Compress for realistic I/O benchmark (bgzip preferred)
-        if command -v bgzip &>/dev/null; then
-            bgzip -@ "$THREADS" "${SRR}_1.fastq" "${SRR}_2.fastq"
-        else
-            gzip -k "${SRR}_1.fastq" "${SRR}_2.fastq"
+    if [ ! -f "${SRR}_1.fastq.gz" ] || [ ! -s "${SRR}_1.fastq.gz" ]; then
+        log "Downloading $SRR from ENA..."
+        local NUM="${SRR#SRR}"
+        local NLEN="${#NUM}"
+        local PREFIX="SRR${NUM:0:3}"
+        if   [ "$NLEN" -le 6 ]; then local SUB=""
+        elif [ "$NLEN" -eq 7 ]; then local SUB="/00${NUM: -1}"
+        elif [ "$NLEN" -eq 8 ]; then local SUB="/0${NUM: -2}"
+        else                          local SUB="/${NUM: -3}"
         fi
+        local BASE="ftp://ftp.sra.ebi.ac.uk/vol1/fastq/${PREFIX}${SUB}/${SRR}"
+        rm -f "${SRR}_1.fastq.gz" "${SRR}_2.fastq.gz"
+        wget -q "${BASE}/${SRR}_1.fastq.gz" -O "${SRR}_1.fastq.gz"
+        wget -q "${BASE}/${SRR}_2.fastq.gz" -O "${SRR}_2.fastq.gz"
     fi
 }
 
@@ -151,12 +150,6 @@ if ! command -v kallisto &>/dev/null; then
     cd "$WORKDIR"
 fi
 
-# ---- SRA toolkit and reference index (same as CPU script) ----------------
-if ! command -v fasterq-dump &>/dev/null; then
-    wget -q https://ftp-trace.ncbi.nlm.nih.gov/sra/sdk/current/sratoolkit.current-ubuntu64.tar.gz
-    tar -xzf sratoolkit.current-ubuntu64.tar.gz
-    sudo cp sratoolkit.*/bin/fasterq-dump sratoolkit.*/bin/prefetch /usr/local/bin/
-fi
 
 if [ ! -f human_index.idx ] || [ ! -s human_index.idx ]; then
     rm -f human_index.idx.gz human_index.idx
@@ -170,15 +163,20 @@ fi
 
 download_sample() {
     local SRR="$1"
-    if [ ! -f "${SRR}_1.fastq.gz" ]; then
-        log "Downloading $SRR..."
-        prefetch "$SRR" --output-directory .
-        fasterq-dump "$SRR" --split-files --outdir . --threads "$THREADS"
-        if command -v bgzip &>/dev/null; then
-            bgzip -@ "$THREADS" "${SRR}_1.fastq" "${SRR}_2.fastq"
-        else
-            gzip -k "${SRR}_1.fastq" "${SRR}_2.fastq"
+    if [ ! -f "${SRR}_1.fastq.gz" ] || [ ! -s "${SRR}_1.fastq.gz" ]; then
+        log "Downloading $SRR from ENA..."
+        local NUM="${SRR#SRR}"
+        local NLEN="${#NUM}"
+        local PREFIX="SRR${NUM:0:3}"
+        if   [ "$NLEN" -le 6 ]; then local SUB=""
+        elif [ "$NLEN" -eq 7 ]; then local SUB="/00${NUM: -1}"
+        elif [ "$NLEN" -eq 8 ]; then local SUB="/0${NUM: -2}"
+        else                          local SUB="/${NUM: -3}"
         fi
+        local BASE="ftp://ftp.sra.ebi.ac.uk/vol1/fastq/${PREFIX}${SUB}/${SRR}"
+        rm -f "${SRR}_1.fastq.gz" "${SRR}_2.fastq.gz"
+        wget -q "${BASE}/${SRR}_1.fastq.gz" -O "${SRR}_1.fastq.gz"
+        wget -q "${BASE}/${SRR}_2.fastq.gz" -O "${SRR}_2.fastq.gz"
     fi
 }
 
