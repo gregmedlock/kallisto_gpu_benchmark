@@ -1,5 +1,8 @@
 .venv/
-results/
+# Ignore raw results but allow figures and summary
+results/*
+!results/*.png
+!results/summary_table.csv
 __pycache__/
 *.pyc
 .DS_Store

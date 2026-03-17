@@ -37,7 +37,11 @@ if not records:
 df = pd.DataFrame(records)
 print(f"Loaded {len(df)} timing records from {df['instance_name'].nunique()} instances.")
 
-# Take median over 3 runs per (instance, tool, dataset)
+# Take median over 3 runs per (instance, tool, dataset).
+# GPU benchmarks include an untimed warmup run to populate the CUDA JIT cache
+# (~/.nv/ComputeCache), so all 3 timed runs reflect steady-state performance.
+# For early instances that lacked the warmup, the median naturally excludes the
+# JIT-inflated first run (which can be 10-30x slower).
 df_med = (
     df.groupby(["instance_name", "instance_type", "role", "tool", "dataset",
                 "n_reads", "price_per_hr"])
@@ -76,37 +80,84 @@ print("Saved: results/summary_table.csv")
 # ---------------------------------------------------------------------------
 # Color palette
 # ---------------------------------------------------------------------------
-CPU_COLOR = "#2176AE"   # blue
-GPU_COLORS = {
-    "g4dn.xlarge":  "#E36414",
-    "g4dn.2xlarge": "#E36414",
-    "g5.xlarge":    "#FB8B24",
-    "g5.2xlarge":   "#FB8B24",
-    "p3.2xlarge":   "#9A031E",
+# Distinct colors per instance type. CPU instances use cool tones, GPU uses warm tones.
+INSTANCE_COLORS = {
+    # CPU c7i — spread across a navy-to-cyan range
+    "c7i.2xlarge":   "#0B3D91",  # navy
+    "c7i.4xlarge":   "#2176AE",  # medium blue
+    "c7i.8xlarge":   "#5DADE2",  # sky blue
+    "c7i.16xlarge":  "#A9DCF0",  # pale cyan
+    # CPU c8 — non-blue colors to stand apart from c7i
+    "c8g.2xlarge":   "#1E8449",  # green (Graviton/ARM)
+    "c8i.2xlarge":   "#17A589",  # teal (Intel)
+    "c8a.2xlarge":   "#6C3483",  # purple (AMD)
+    # GPU — warm tones
+    "g4dn.xlarge":   "#E36414",  # orange
+    "g4dn.2xlarge":  "#E36414",
+    "g5.xlarge":     "#FB8B24",  # amber
+    "g5.2xlarge":    "#FB8B24",
+    "g6e.xlarge":    "#D35400",  # burnt orange
+    "g6e.2xlarge":   "#C0392B",  # red
+    "p3.2xlarge":    "#9A031E",  # dark red
 }
 
 def get_color(row):
-    if row["role"] == "cpu":
-        return CPU_COLOR
-    return GPU_COLORS.get(row["instance_type"], "#888888")
+    return INSTANCE_COLORS.get(row["instance_type"], "#888888")
 
 df_med["color"] = df_med.apply(get_color, axis=1)
 
 # ---------------------------------------------------------------------------
-# Figure 1: Wall time vs reads (matches paper Fig. 1 aesthetic)
+# Figure 1: Wall time vs reads (both datasets on one plot, lines per instance)
 # ---------------------------------------------------------------------------
+# Only include instances that have data for both datasets
+sub = df_med.copy()
+sub = sub[~((sub["role"] == "gpu") & (sub["tool"] == "cpu"))]
+both = sub.groupby("instance_name")["dataset"].nunique()
+instances_with_both = both[both == 2].index
+sub = sub[sub["instance_name"].isin(instances_with_both)]
+
+fig, ax = plt.subplots(figsize=(10, 6))
+
+for inst_name, grp in sub.groupby("instance_name"):
+    grp = grp.sort_values("n_reads")
+    row0 = grp.iloc[0]
+    label = f"{row0['instance_type']} ({'GPU-kallisto' if row0['role']=='gpu' else 'kallisto'})"
+    color = row0["color"]
+    is_gpu = row0["role"] == "gpu"
+    marker = "D" if is_gpu else "o"
+    fillstyle = "full" if is_gpu else "full"
+    linestyle = "--" if is_gpu else "-"
+    ax.plot(grp["n_reads"] / 1e6, grp["wall_time_s"],
+            marker=marker, color=color, markersize=7, linewidth=1.5,
+            linestyle=linestyle, zorder=3, label=label)
+
+ax.set_xlabel("Number of reads (millions)", fontsize=12)
+ax.set_ylabel("Wall time (seconds)", fontsize=12)
+ax.set_title("Wall time vs reads — small & large datasets", fontsize=13)
+ax.legend(loc="upper left", fontsize=8, framealpha=0.9)
+ax.grid(True, alpha=0.3)
+ax.set_xlim(left=0)
+ax.set_ylim(bottom=0)
+
+fig.tight_layout()
+fig.savefig(FIGURES_DIR / "wall_time_combined.png", dpi=150)
+plt.close()
+print("Saved: results/wall_time_combined.png")
+
+# Also keep per-dataset plots for instances that only appear in one dataset
 for dataset in df_med["dataset"].unique():
-    sub = df_med[df_med["dataset"] == dataset].copy()
-    # Show only the primary tool per instance (gpu-kallisto for GPU, kallisto for CPU)
-    sub = sub[~((sub["role"] == "gpu") & (sub["tool"] == "cpu"))]
-    sub = sub.sort_values("n_reads")
+    dsub = df_med[df_med["dataset"] == dataset].copy()
+    dsub = dsub[~((dsub["role"] == "gpu") & (dsub["tool"] == "cpu"))]
+    dsub = dsub.sort_values("n_reads")
 
     fig, ax = plt.subplots(figsize=(8, 5))
 
-    for _, row in sub.iterrows():
+    for _, row in dsub.iterrows():
         label = f"{row['instance_type']} ({'GPU-kallisto' if row['role']=='gpu' else 'kallisto'})"
+        marker = "D" if row["role"] == "gpu" else "o"
         ax.scatter(row["n_reads"] / 1e6, row["wall_time_s"],
-                   color=row["color"], s=80, zorder=3, label=label)
+                   color=row["color"], s=80, zorder=3, label=label,
+                   marker=marker)
 
     ax.set_xlabel("Number of reads (millions)", fontsize=12)
     ax.set_ylabel("Wall time (seconds)", fontsize=12)
@@ -132,6 +183,8 @@ for dataset in df_med["dataset"].unique():
 
     fig, ax = plt.subplots(figsize=(10, 5))
 
+    # Use hatching to distinguish CPU vs GPU bars
+    hatches = ["///" if r == "gpu" else "" for r in sub["role"]]
     bars = ax.barh(
         sub["display_name"],
         sub["reads_per_dollar_M"],
@@ -139,6 +192,10 @@ for dataset in df_med["dataset"].unique():
         edgecolor="white",
         linewidth=0.5,
     )
+    for bar, hatch in zip(bars, hatches):
+        bar.set_hatch(hatch)
+        if hatch:
+            bar.set_edgecolor("#333333")
 
     # Label each bar with the value
     for bar, (_, row) in zip(bars, sub.iterrows()):
@@ -149,13 +206,11 @@ for dataset in df_med["dataset"].unique():
             va="center", fontsize=8,
         )
 
-    # Legend patches
+    # Legend: CPU (solid) vs GPU (hatched)
     from matplotlib.patches import Patch
     legend_handles = [
-        Patch(color=CPU_COLOR, label="CPU kallisto"),
-        Patch(color="#E36414", label="GPU-kallisto (T4)"),
-        Patch(color="#FB8B24", label="GPU-kallisto (A10G)"),
-        Patch(color="#9A031E", label="GPU-kallisto (V100)"),
+        Patch(facecolor="#2176AE", label="CPU kallisto"),
+        Patch(facecolor="#FB8B24", hatch="///", edgecolor="#333333", label="GPU-kallisto"),
     ]
     ax.legend(handles=legend_handles, fontsize=9, loc="lower right")
 
@@ -194,7 +249,7 @@ if not cpu_rows.empty:
 
         fig, ax = plt.subplots(figsize=(7, 5))
         for _, row in sub.iterrows():
-            color = GPU_COLORS.get(row["instance_type"], "#888888")
+            color = INSTANCE_COLORS.get(row["instance_type"], "#888888")
             ax.scatter(row["price_per_hr"], row["speedup"],
                        color=color, s=120, zorder=3)
             ax.annotate(

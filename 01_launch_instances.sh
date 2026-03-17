@@ -25,7 +25,8 @@ KEY="$HOME/.ssh/kallisto-bench.pem"
 # Ubuntu 22.04 LTS (HVM, SSD) in us-east-1.
 # GPU instances need a CUDA-capable AMI; we use the AWS Deep Learning Base AMI
 # which ships with CUDA 12, NVIDIA drivers, and conda pre-installed.
-CPU_AMI="ami-0c7217cdde317cfec"          # Ubuntu 22.04 LTS us-east-1
+CPU_AMI="ami-0c7217cdde317cfec"          # Ubuntu 22.04 LTS x86_64 us-east-1
+CPU_ARM_AMI="ami-028f4acf86df833a8"      # Ubuntu 22.04 LTS arm64 us-east-1
 GPU_AMI="ami-02d9d948a3b2142ba"          # Deep Learning Base OSS Nvidia Driver GPU AMI (Ubuntu 22.04) 20260307 us-east-1
 
 # ---------------------------------------------------------------------------
@@ -37,10 +38,17 @@ INSTANCES=(
     "cpu-c7i-4xl:c7i.4xlarge:$CPU_AMI:cpu:0.714"
     "cpu-c7i-8xl:c7i.8xlarge:$CPU_AMI:cpu:1.428"
     "cpu-c7i-16xl:c7i.16xlarge:$CPU_AMI:cpu:2.856"
-    "gpu-g4dn-xl:g4dn.xlarge:$GPU_AMI:gpu:0.526"
-    "gpu-g4dn-2xl:g4dn.2xlarge:$GPU_AMI:gpu:0.752"
+    "cpu-c8g-2xl:c8g.2xlarge:$CPU_ARM_AMI:cpu:0.319"
+    "cpu-c8i-2xl:c8i.2xlarge:$CPU_AMI:cpu:0.375"
+    "cpu-c8a-2xl:c8a.2xlarge:$CPU_AMI:cpu:0.431"
+    # g4dn (T4, 16GB VRAM) excluded: gpu-kallisto OOMs building the GPU EC map
+    # with the human transcriptome index (785K ECs, 116M k-mers).
+    # "gpu-g4dn-xl:g4dn.xlarge:$GPU_AMI:gpu:0.526"
+    # "gpu-g4dn-2xl:g4dn.2xlarge:$GPU_AMI:gpu:0.752"
     "gpu-g5-xl:g5.xlarge:$GPU_AMI:gpu:1.006"
     "gpu-g5-2xl:g5.2xlarge:$GPU_AMI:gpu:1.212"
+    "gpu-g6e-xl:g6e.xlarge:$GPU_AMI:gpu:1.860"
+    "gpu-g6e-2xl:g6e.2xlarge:$GPU_AMI:gpu:2.744"
     # "gpu-p3-2xl:p3.2xlarge:$GPU_AMI:gpu:3.060"  # requires P-instance quota (0 by default)
 )
 
@@ -61,8 +69,14 @@ GPU_USERDATA=$(base64 <<'USERDATA' | tr -d '\n'
 #!/bin/bash
 # Deep Learning AMI already has CUDA — just add build tools
 apt-get update -y
-apt-get install -y build-essential cmake git curl wget zlib1g-dev libbz2-dev \
+apt-get install -y build-essential git curl wget zlib1g-dev libbz2-dev \
     liblzma-dev libcurl4-openssl-dev libssl-dev python3-pip unzip awscli
+# Ubuntu 22.04 ships cmake 3.22; gpu-kallisto needs 3.23+
+wget -q https://github.com/Kitware/CMake/releases/download/v3.28.3/cmake-3.28.3-linux-x86_64.tar.gz
+tar -xzf cmake-3.28.3-linux-x86_64.tar.gz -C /opt
+ln -sf /opt/cmake-3.28.3-linux-x86_64/bin/cmake /usr/local/bin/cmake
+ln -sf /opt/cmake-3.28.3-linux-x86_64/bin/ctest /usr/local/bin/ctest
+rm cmake-3.28.3-linux-x86_64.tar.gz
 touch /tmp/bootstrap_done
 USERDATA
 )
@@ -72,6 +86,10 @@ USERDATA
 # ---------------------------------------------------------------------------
 launch_instance() {
     local NAME="$1" ITYPE="$2" AMI="$3" ROLE="$4" USERDATA_B64="$5"
+    # GPU instances need more disk: Deep Learning AMI (~50 GB for CUDA toolkits)
+    # plus ~45 GB FASTQ data + build artifacts. CPU instances are fine with 100 GB.
+    local VOL_SIZE=100
+    [[ "$ROLE" == "gpu" ]] && VOL_SIZE=200
     # To use Spot instead (saves ~60-70%), add this flag to the command below:
     #   --instance-market-options '{"MarketType":"spot","SpotOptions":{"SpotInstanceType":"one-time"}}'
     aws ec2 run-instances \
@@ -83,7 +101,8 @@ launch_instance() {
         --associate-public-ip-address \
         --user-data "$USERDATA_B64" \
         --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=kallisto-bench-$NAME},{Key=BenchmarkRole,Value=$ROLE}]" \
-        --block-device-mappings '[{"DeviceName":"/dev/sda1","Ebs":{"VolumeSize":100,"VolumeType":"gp3"}}]' \
+        --block-device-mappings "[{\"DeviceName\":\"/dev/sda1\",\"Ebs\":{\"VolumeSize\":${VOL_SIZE},\"VolumeType\":\"gp3\"}}]" \
+        --iam-instance-profile Name=kallisto-bench-s3 \
         --query 'Instances[0].InstanceId' \
         --output text
 }

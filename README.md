@@ -20,20 +20,26 @@ to get **reads per dollar** as the primary metric.
 
 ## Instance Matrix
 
-| Instance | vCPU | GPU | On-Demand (us-east-1) | Role |
-|---|---|---|---|---|
-| c7i.2xlarge | 8 | — | $0.357/hr | CPU |
-| c7i.4xlarge | 16 | — | $0.714/hr | CPU |
-| c7i.8xlarge | 32 | — | $1.428/hr | CPU |
-| c7i.16xlarge | 64 | — | $2.856/hr | CPU |
-| g4dn.xlarge | 4 | T4 (Turing) | $0.526/hr | GPU |
-| g4dn.2xlarge | 8 | T4 (Turing) | $0.752/hr | GPU |
-| g5.xlarge | 4 | A10G (Ampere) | $1.006/hr | GPU |
-| g5.2xlarge | 8 | A10G (Ampere) | $1.212/hr | GPU |
-| p3.2xlarge | 8 | V100 (Volta) | $3.06/hr | GPU |
+| Instance | vCPU | RAM | GPU (VRAM) | NVMe | On-Demand (us-east-1) | Role |
+|---|---|---|---|---|---|---|
+| c7i.2xlarge | 8 | 16 GiB | — | — | $0.357/hr | CPU |
+| c7i.4xlarge | 16 | 32 GiB | — | — | $0.714/hr | CPU |
+| c7i.8xlarge | 32 | 64 GiB | — | — | $1.428/hr | CPU |
+| c7i.16xlarge | 64 | 128 GiB | — | — | $2.856/hr | CPU |
+| c8g.2xlarge | 8 | 16 GiB | — | — | $0.319/hr | CPU (Graviton4 ARM) |
+| c8i.2xlarge | 8 | 16 GiB | — | — | $0.375/hr | CPU (Intel Granite Rapids) |
+| c8a.2xlarge | 8 | 16 GiB | — | — | $0.431/hr | CPU (AMD EPYC) |
+| g5.xlarge | 4 | 16 GiB | A10G (24 GB) | 250 GB | $1.006/hr | GPU |
+| g6e.xlarge | 4 | 32 GiB | L40S (48 GB) | 250 GB | $1.860/hr | GPU |
+| g6e.2xlarge | 8 | 64 GiB | L40S (48 GB) | 450 GB | $2.744/hr | GPU |
 
-> GPU-kallisto requires Volta (sm_70) or later. All GPU instances listed meet
-> this requirement. The g4dn uses Turing (sm_75).
+> GPU-kallisto requires Volta (sm_70) or later and at least 24 GB of VRAM for
+> the human transcriptome index. The g4dn (T4, 16 GB) was tested but OOMs
+> during GPU EC map construction. The g5 uses Ampere (sm_86), the g6e uses
+> Ada Lovelace (sm_89).
+>
+> GPU instances include local NVMe SSDs (much faster than the default EBS gp3
+> storage). The benchmark uses NVMe as the working directory for GPU runs.
 
 ---
 
@@ -41,9 +47,9 @@ to get **reads per dollar** as the primary metric.
 
 - An AWS account (free tier is fine for setup; instances are not free-tier)
 - A Unix/macOS terminal or WSL2 on Windows
-- ~$15–30 budget (total runtime across all instances is ~2–4 hours)
-- The Geuvadis data is public on SRA; no data transfer fees apply for
-  downloading within the same AWS region
+- `jq` installed locally (used by all shell scripts)
+- Python environment managed via `uv` (`uv sync` to install dependencies)
+- ~$15–30 budget (total runtime across all instances is ~4–8 hours)
 
 ---
 
@@ -71,10 +77,40 @@ This avoids using your root account credentials for CLI operations.
 2. Go to **IAM → Users → Create user**
 3. Name it `benchmark-user`
 4. Select **Attach policies directly**
-5. Attach these two managed policies:
+5. Attach these managed policies:
    - `AmazonEC2FullAccess`
-   - `AmazonS3FullAccess` (needed to stage results)
-6. After creation, click the user → **Security credentials** → **Create
+   - `AmazonS3FullAccess` (needed for the S3 data cache)
+   - `ServiceQuotasFullAccess` (needed to check/request GPU quotas)
+6. Add an inline policy for IAM instance profile management (needed by
+   `00_setup_s3_cache.sh` to let EC2 instances access S3):
+   ```json
+   {
+     "Version": "2012-10-17",
+     "Statement": [
+       {
+         "Effect": "Allow",
+         "Action": [
+           "iam:CreateRole", "iam:GetRole", "iam:PutRolePolicy",
+           "iam:CreateInstanceProfile", "iam:GetInstanceProfile",
+           "iam:AddRoleToInstanceProfile", "iam:PassRole"
+         ],
+         "Resource": [
+           "arn:aws:iam::*:role/kallisto-bench-s3",
+           "arn:aws:iam::*:instance-profile/kallisto-bench-s3"
+         ]
+       },
+       {
+         "Effect": "Allow",
+         "Action": [
+           "ec2:DescribeIamInstanceProfileAssociations",
+           "ec2:AssociateIamInstanceProfile"
+         ],
+         "Resource": "*"
+       }
+     ]
+   }
+   ```
+7. After creation, click the user → **Security credentials** → **Create
    access key** → choose "CLI" → download the CSV
 
 ### 1.3 Configure the CLI
@@ -131,55 +167,78 @@ echo "Security group: $SG_ID"
 
 ### 1.6 Request GPU Quota (if needed)
 
-New AWS accounts have a vCPU quota of 0 for GPU instances by default.
+New AWS accounts have a vCPU quota of 0 for GPU instances by default. All GPU
+instances in this benchmark (g4dn, g5, g6e) fall under the **G and VT** quota.
 
 ```bash
-# Check your current limit for G and P instances - requires ServiceQuotasFullAccess policy for your user as well
+# Check your current limit for G and VT instances
 aws service-quotas get-service-quota \
     --service-code ec2 \
     --quota-code L-DB2E81BA   # Running On-Demand G and VT instances
 
 # If the value is 0, request an increase.
-# The 5 GPU instances together need 32 vCPUs to run simultaneously,
-# but requesting 8 is usually auto-approved within minutes and is enough
-# to run instances one at a time. Request 32 only if you want all 5 at once
-# (may take hours or days to approve).
+# GPU instances run sequentially, so 8 vCPUs is enough (the largest single
+# GPU instance is g4dn.2xlarge at 8 vCPUs). Requesting 8 is usually
+# auto-approved within minutes.
 aws service-quotas request-service-quota-increase \
     --service-code ec2 \
     --quota-code L-DB2E81BA \
     --desired-value 8
 ```
 
-You can also do this through the console: EC2 → Limits → search "G instances"
+You can also do this through the console: EC2 → Limits → search "G and VT"
 → Request increase.
 
 ---
 
-## Part 2: Run the Full Benchmark
+## Part 2: Configure and Run
 
-Edit `01_launch_instances.sh` to set your `SG_ID` and `SUBNET_ID`, then run
-it. The script handles the entire pipeline — launch, benchmark, collect, and
-terminate — **one instance at a time**, so only one instance is running at any
-moment (staying within the 8 vCPU GPU quota).
+### 2.1 Set Up Local Config
+
+Save your AWS resource IDs in `config.local.sh` (gitignored):
 
 ```bash
-# Find a subnet in your default VPC (uses VPC_ID from Part 1.5)
-SUBNET_ID=$(aws ec2 describe-subnets \
+cat > config.local.sh <<EOF
+SG_ID="$SG_ID"         # from Part 1.5
+SUBNET_ID="$(aws ec2 describe-subnets \
     --filters Name=vpc-id,Values=$VPC_ID \
-    --query 'Subnets[0].SubnetId' --output text)
+    --query 'Subnets[0].SubnetId' --output text)"
+S3_CACHE_BUCKET=""      # filled in by 00_setup_s3_cache.sh
+EOF
+```
 
-# Edit SG_ID and SUBNET_ID at the top of the script, then:
+### 2.2 Set Up S3 Data Cache (recommended)
+
+This creates an S3 bucket and IAM instance profile so EC2 instances can
+cache FASTQ files and the kallisto index. Without this, each instance
+downloads ~45 GB from ENA (European Nucleotide Archive), which takes hours.
+With the cache, subsequent instances pull from same-region S3 in minutes.
+
+```bash
+bash 00_setup_s3_cache.sh
+```
+
+### 2.3 Run the Benchmark
+
+```bash
 bash 01_launch_instances.sh
 ```
 
+The script runs in two phases:
+1. **Phase 1 (CPU):** Launches all 4 CPU instances concurrently, runs
+   benchmarks in parallel, collects results, then terminates all.
+2. **Phase 2 (GPU):** Launches GPU instances one at a time (to stay within
+   the 8 vCPU G/VT quota), benchmarks each, terminates before launching the
+   next.
+
 For each instance, the script:
 1. Launches the instance and writes its ID to `results/instance_ids.json`
-2. SSHes in, installs dependencies, downloads Geuvadis samples, runs the benchmark
+2. SSHes in, installs dependencies, downloads test data (from S3 cache or
+   ENA), and runs the benchmark
 3. Polls until complete and pulls `results/timing_<name>.json`
-4. Terminates the instance before launching the next
+4. Terminates the instance
 
-Total runtime is ~8–12 hours (each instance takes 60–120 minutes, dominated by
-SRA downloads and compilation). If the script is interrupted, re-running it
+Total runtime is ~4–8 hours. If the script is interrupted, re-running it
 skips any instance whose `timing_<name>.json` already exists.
 
 ---
@@ -187,7 +246,6 @@ skips any instance whose `timing_<name>.json` already exists.
 ## Part 3: Analyze Results
 
 ```bash
-# Run cost-normalized analysis and generate plots
 uv run python3 04_analyze.py
 ```
 
@@ -217,27 +275,87 @@ aws ec2 terminate-instances \
 
 | Phase | Estimated Cost |
 |---|---|
-| CPU instances (4 types × ~1.5 hr avg) | ~$5 |
-| GPU instances (5 types × ~0.5 hr avg) | ~$8 |
-| Data transfer (SRA → EC2, same region) | ~$0 |
-| **Total** | **~$13** |
+| CPU instances (4 types, concurrent, ~1.5 hr) | ~$8 |
+| GPU instances (5 types, sequential, ~0.5 hr each) | ~$6 |
+| S3 cache storage (~50 GB for a few days) | ~$0.10 |
+| **Total** | **~$14** |
 
-Instances run sequentially so costs are the same as before — only one instance
-is billed at a time. Using spot instances (see `01_launch_instances.sh`
-comments) cuts this to ~$4–6 but adds the risk of interruption mid-run
-(already-collected results are preserved and the script will resume from where
-it left off).
+Using spot instances (see `01_launch_instances.sh` comments) cuts this to
+~$4–6 but adds the risk of interruption mid-run (already-collected results
+are preserved and the script will resume from where it left off).
 
 ---
 
 ## Notes on Interpretation
 
-- The paper's RTX 5090 is not available on EC2. The closest is an H100 on
-  `p5.48xlarge` (~$98/hr), which would be prohibitively expensive for this
-  benchmark. The A10G (`g5`) and V100 (`p3`) bracket a reasonable price range.
+- The paper's RTX 5090 is not available on EC2. The closest single-GPU option
+  is the L40S on `g6e.xlarge` (~$1.86/hr), which has roughly half the memory
+  bandwidth but comparable FP32 compute. The g5 (A10G) and g6e (L40S) provide
+  a budget-to-near-flagship range.
+- **Input compression format (gzip vs bgzip) is critical for GPU performance.**
+  gpu-kallisto uses nvcomp's batched deflate API for GPU-accelerated
+  decompression. Standard gzip files (as distributed by ENA/SRA) are a single
+  monolithic deflate stream that cannot be parallelized — the GPU decompresses
+  sequentially, wasting its thousands of cores. bgzip (block-gzip, from
+  htslib) compresses data as independent 64KB blocks that the GPU can
+  decompress in parallel. The paper specifies bgzip-converted input. Without
+  bgzip, decompression accounts for ~95% of gpu-kallisto wall time on EC2.
+  Convert with: `gunzip -c file.fastq.gz | bgzip -@ 8 > file.bgz.fastq.gz`.
+  CPU kallisto is unaffected (zlib handles both formats identically).
+- **GPU memory requirements:** gpu-kallisto has two memory bottlenecks:
+  1. **VRAM for the GPU EC map:** ~4 GB for the human transcriptome index
+     (785K equivalence classes, 116M k-mers). The T4 (16 GB) OOMs during
+     this phase; the A10G (24 GB) and L40S (48 GB) handle it fine.
+  2. **Pinned host (system) RAM for FASTQ loading:** gpu-kallisto loads
+     entire compressed FASTQ files into CUDA pinned memory
+     (`cudaMallocHost`). For the large dataset (SRR30898520), R1+R2 total
+     ~41 GB compressed, requiring ~48 GB+ of system RAM. Instances with
+     32 GB RAM (g5.xlarge, g6e.xlarge) succeed on the small dataset but
+     OOM on the large one. The g6e.2xlarge (64 GB RAM) is needed for the
+     large dataset.
+- **Storage: NVMe vs EBS.** GPU instances include local NVMe SSDs (~3-7 GB/s
+  sequential read) that are much faster than the default EBS gp3 (125 MB/s
+  baseline). However, CPU instances are compute-bound — EBS throughput is not
+  their bottleneck. Switching CPU instances to NVMe would yield ≤16%
+  improvement. For GPU instances, NVMe reduces wall time by ~11% vs EBS when
+  using standard gzip (the I/O-bound regime). With bgzip input (GPU can
+  decompress in parallel), the storage bottleneck is less dominant.
 - CPU kallisto is run with all available vCPUs (`--threads=$(nproc)`) on each
   instance type so the CPU results are also best-case.
+- GPU instances also run CPU kallisto on the small dataset for a same-machine
+  speedup comparison (Fig. 3). The large dataset CPU run is skipped on GPU
+  instances — it takes hours on their limited vCPUs (e.g. 4 on g4dn.xlarge)
+  and the dedicated c7i instances provide the cost-normalized comparison.
 - The EM algorithm runs on CPU in the paper's implementation even in GPU mode;
   Table 1 shows it dominates runtime at 3,148 ms. This means GPU throughput
   numbers improve significantly as read count grows (the EM portion stays
   roughly constant), which benefits the cost comparison for large datasets.
+- **CUDA warmup:** The first gpu-kallisto invocation on a fresh instance
+  triggers CUDA JIT compilation of PTX intermediate code to native GPU
+  machine code, adding minutes of one-time overhead (e.g. ~15 min on A10G
+  vs ~30s for subsequent runs). The benchmark runs an untimed warmup
+  invocation before the 3 timed runs to ensure the JIT cache
+  (`~/.nv/ComputeCache`) is populated and timings reflect steady-state
+  performance. This mirrors how the tool would perform in production after
+  the first use.
+
+---
+
+## Reproducibility Notes
+
+- **Test data:** The paper uses SRR1069546 (~25M reads) as the small dataset,
+  but it requires dbGaP access (study phs000424). This benchmark substitutes
+  ERR188021 (~32M reads), a comparable Geuvadis sample available directly from
+  ENA without access restrictions. The large dataset (SRR30898520, ~295M reads)
+  is the same as the paper.
+- **CUDA version:** gpu-kallisto's bundled cuCollections requires CCCL >=3.0,
+  which ships with CUDA 13.0. The build explicitly targets CUDA 13.0 via
+  `-DCMAKE_CUDA_COMPILER=/usr/local/cuda-13.0/bin/nvcc`. The AWS Deep Learning
+  Base AMI ships with multiple CUDA versions (12.6, 12.8, 12.9, 13.0).
+- **nvcomp:** gpu-kallisto requires the nvcomp compression library. The
+  benchmark installs nvcomp 4.0.1 from NVIDIA's download server during setup.
+  nvcomp 4.x changed the batched deflate decompression API, so the build
+  patches `GPUReadLoader.cuh` to remove the deprecated opts parameter.
+- **S3 data cache:** An optional S3 bucket (`00_setup_s3_cache.sh`) caches
+  FASTQ files and the kallisto index so that subsequent instances (especially
+  GPU instances in Phase 2) download in minutes instead of hours from ENA.

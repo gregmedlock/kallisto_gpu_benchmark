@@ -40,7 +40,7 @@ collect_from_instance() {
     # Check if benchmark is done
     if ssh -n -o StrictHostKeyChecking=no -o ConnectTimeout=5 -o BatchMode=yes \
         -i "$KEY" "ubuntu@$IP" \
-        "grep -q 'benchmark complete' /tmp/bench_output.log 2>/dev/null"; then
+        "grep -q 'benchmark complete' ~/bench_output.log 2>/dev/null"; then
         IS_DONE=1
     else
         IS_DONE=0
@@ -48,7 +48,7 @@ collect_from_instance() {
 
     if [[ "$IS_DONE" -eq 0 ]]; then
         LAST_LINE=$(ssh -n -o StrictHostKeyChecking=no -i "$KEY" "ubuntu@$IP" \
-            "tail -1 /tmp/bench_output.log 2>/dev/null || echo 'not started'")
+            "tail -1 ~/bench_output.log 2>/dev/null || echo 'not started'")
         echo "  $NAME: in progress — $LAST_LINE"
         return 1
     fi
@@ -57,12 +57,12 @@ collect_from_instance() {
 
     # Pull timing lines and construct JSON
     ssh -n -o StrictHostKeyChecking=no -i "$KEY" "ubuntu@$IP" \
-        "grep '^TIMING:' /tmp/bench_output.log" \
+        "grep '^TIMING:' ~/bench_output.log" \
         > "$RESULTS_DIR/raw_timing_${NAME}.txt" 2>/dev/null || true
 
     # Also grab the full log
     scp -o StrictHostKeyChecking=no -i "$KEY" \
-        "ubuntu@$IP:/tmp/bench_output.log" \
+        "ubuntu@$IP:~/bench_output.log" \
         "$RESULTS_DIR/full_log_${NAME}.log" 2>/dev/null || true
 
     # Parse timing lines and emit JSON
